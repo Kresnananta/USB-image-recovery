@@ -45,6 +45,9 @@ Buka PowerShell **Run as Administrator**, lalu pindai misalnya drive `E:`:
 python .\usb_image_recovery.py \\.\E: -o C:\Recovered-USB
 ```
 
+Program menangani persyaratan sector-aligned I/O milik raw volume Windows secara
+otomatis. Karena itu, gunakan path device `\\.\E:` dan bukan hanya `E:\`.
+
 Uji kandidat tanpa menulis file:
 
 ```powershell
@@ -97,6 +100,12 @@ Tampilkan bantuan lengkap:
 
 ```bash
 python3 usb_image_recovery.py --help
+```
+
+Untuk melihat alasan kandidat signature ditolak:
+
+```powershell
+python .\usb_image_recovery.py \\.\E: --dry-run --formats jpg,png --verbose
 ```
 
 Nama hasil memuat nomor urut, format, offset asal, dan potongan SHA-256. File

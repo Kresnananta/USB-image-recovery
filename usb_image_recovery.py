@@ -9,6 +9,7 @@ found alongside deleted ones.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -18,9 +19,9 @@ import struct
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable
+from typing import BinaryIO, Callable, Iterable, Iterator
 
 
 KIB = 1024
@@ -28,6 +29,7 @@ MIB = 1024 * KIB
 DEFAULT_CHUNK_SIZE = 8 * MIB
 DEFAULT_MAX_FILE_SIZE = 512 * MIB
 COPY_CHUNK_SIZE = 1 * MIB
+WINDOWS_SECTOR_SIZE = 512
 
 
 class InvalidImage(ValueError):
@@ -49,6 +51,118 @@ class RecoveryStats:
     duplicates: int = 0
     rejected: int = 0
     bytes_written: int = 0
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
+
+
+class AlignedDeviceReader:
+    """Expose normal seek/read semantics over a sector-aligned raw device."""
+
+    def __init__(
+        self,
+        raw: BinaryIO,
+        alignment: int = WINDOWS_SECTOR_SIZE,
+        size: int | None = None,
+    ) -> None:
+        self.raw = raw
+        self.alignment = alignment
+        self.size = size
+        self.position = 0
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self.position + offset
+        elif whence == os.SEEK_END and self.size is not None:
+            position = self.size + offset
+        else:
+            raise OSError("seek relatif terhadap akhir memerlukan ukuran device")
+        if position < 0:
+            raise OSError("tidak dapat seek ke offset negatif")
+        self.position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            if self.size is None:
+                raise OSError("pembacaan tanpa batas memerlukan ukuran device")
+            size = self.size - self.position
+        if size == 0 or (self.size is not None and self.position >= self.size):
+            return b""
+        if self.size is not None:
+            size = min(size, self.size - self.position)
+
+        aligned_start = self.position - (self.position % self.alignment)
+        prefix = self.position - aligned_start
+        needed = prefix + size
+        aligned_size = (
+            (needed + self.alignment - 1) // self.alignment * self.alignment
+        )
+        if self.size is not None:
+            aligned_size = min(aligned_size, self.size - aligned_start)
+
+        self.raw.seek(aligned_start)
+        data = self.raw.read(aligned_size)
+        result = data[prefix : prefix + size]
+        self.position += len(result)
+        return result
+
+
+def windows_device_size(raw: BinaryIO) -> int | None:
+    if os.name != "nt":
+        return None
+    import msvcrt
+
+    ioctl_disk_get_length_info = 0x0007405C
+    length = ctypes.c_longlong()
+    returned = ctypes.c_ulong()
+    handle = msvcrt.get_osfhandle(raw.fileno())
+    success = ctypes.windll.kernel32.DeviceIoControl(
+        handle,
+        ioctl_disk_get_length_info,
+        None,
+        0,
+        ctypes.byref(length),
+        ctypes.sizeof(length),
+        ctypes.byref(returned),
+        None,
+    )
+    return length.value if success else None
+
+
+def filesystem_size_from_boot_sector(boot: bytes) -> int | None:
+    if len(boot) < 512:
+        return None
+    if boot[3:11] == b"EXFAT   ":
+        sector_shift = boot[108]
+        if 9 <= sector_shift <= 12:
+            return struct.unpack_from("<Q", boot, 72)[0] << sector_shift
+        return None
+
+    bytes_per_sector = struct.unpack_from("<H", boot, 11)[0]
+    if bytes_per_sector not in (512, 1024, 2048, 4096):
+        return None
+    total_sectors_16 = struct.unpack_from("<H", boot, 19)[0]
+    total_sectors = total_sectors_16 or struct.unpack_from("<I", boot, 32)[0]
+    return total_sectors * bytes_per_sector if total_sectors else None
+
+
+@contextlib.contextmanager
+def open_source(path: str) -> Iterator[BinaryIO]:
+    raw = open(path, "rb", buffering=0)
+    try:
+        if os.name == "nt" and re.match(r"^\\\\\.\\[A-Za-z]:$", path):
+            boot = raw.read(WINDOWS_SECTOR_SIZE)
+            raw.seek(0)
+            size = filesystem_size_from_boot_sector(boot)
+            yield AlignedDeviceReader(raw, size=size or windows_device_size(raw))
+        else:
+            yield raw
+    finally:
+        raw.close()
 
 
 def read_exact(source: BinaryIO, size: int) -> bytes:
@@ -618,6 +732,7 @@ def recover(
     dry_run: bool,
     keep_duplicates: bool,
     quiet: bool,
+    verbose: bool = False,
 ) -> RecoveryStats:
     stats = RecoveryStats()
     overlap_size = max(len(sig) for spec in specs for sig in spec.signatures) - 1
@@ -679,8 +794,17 @@ def recover(
                         f"[{action}] {filename} ({file_size / KIB:.1f} KiB)",
                         flush=True,
                     )
-            except (InvalidImage, OSError, struct.error):
+            except (InvalidImage, OSError, struct.error) as error:
                 stats.rejected += 1
+                reason = f"{spec.name}: {error}"
+                stats.rejection_reasons[reason] = (
+                    stats.rejection_reasons.get(reason, 0) + 1
+                )
+                if verbose:
+                    print(
+                        f"[TOLAK] {spec.name} offset 0x{candidate_offset:x}: {error}",
+                        file=sys.stderr,
+                    )
             finally:
                 source.seek(scan_position)
 
@@ -800,6 +924,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="simpan file dengan isi identik lebih dari sekali",
     )
     parser.add_argument("--quiet", action="store_true", help="kurangi output")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="tampilkan offset dan alasan setiap kandidat ditolak",
+    )
     return parser
 
 
@@ -832,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.output is not None:
             ensure_safe_output(args.source, args.output)
-        with open(args.source, "rb", buffering=0) as source:
+        with open_source(args.source) as source:
             filesystem = detect_filesystem(source)
             source_size = get_source_size(source)
             if not args.quiet:
@@ -862,6 +991,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 keep_duplicates=args.keep_duplicates,
                 quiet=args.quiet,
+                verbose=args.verbose,
             )
     except PermissionError:
         print(
@@ -881,6 +1011,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.dry_run:
         print(f"Data ditulis: {stats.bytes_written / MIB:,.2f} MiB")
+    if stats.rejection_reasons and not args.quiet:
+        print("Alasan penolakan terbanyak:")
+        reasons = sorted(
+            stats.rejection_reasons.items(), key=lambda item: item[1], reverse=True
+        )
+        for reason, count in reasons[:5]:
+            print(f"  {count:4d}x {reason}")
     return 0
 
 

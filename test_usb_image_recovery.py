@@ -107,10 +107,30 @@ class ParserTests(unittest.TestCase):
     def test_detects_fat32_and_exfat(self):
         fat32 = bytearray(512)
         fat32[82:90] = b"FAT32   "
+        struct.pack_into("<H", fat32, 11, 512)
+        struct.pack_into("<I", fat32, 32, 2048)
         exfat = bytearray(512)
         exfat[3:11] = b"EXFAT   "
+        struct.pack_into("<Q", exfat, 72, 4096)
+        exfat[108] = 9
         self.assertEqual(recovery.detect_filesystem(io.BytesIO(fat32)), "FAT32")
         self.assertEqual(recovery.detect_filesystem(io.BytesIO(exfat)), "exFAT")
+        self.assertEqual(
+            recovery.filesystem_size_from_boot_sector(fat32), 1024 * 1024
+        )
+        self.assertEqual(
+            recovery.filesystem_size_from_boot_sector(exfat), 2 * 1024 * 1024
+        )
+
+    def test_aligned_reader_supports_unaligned_image_reads(self):
+        data = bytes(range(256)) * 4
+        raw = io.BytesIO(data)
+        source = recovery.AlignedDeviceReader(raw, alignment=512, size=len(data))
+
+        source.seek(513)
+        self.assertEqual(source.read(17), data[513:530])
+        source.seek(-5, recovery.os.SEEK_CUR)
+        self.assertEqual(source.read(9), data[525:534])
 
 
 class RecoveryTests(unittest.TestCase):
